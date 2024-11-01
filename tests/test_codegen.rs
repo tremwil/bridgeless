@@ -1,115 +1,145 @@
-//#![no_std]
+// #![no_std]
+
+use std::marker::PhantomData;
 
 use bridgeless::*;
+use internal::FromThinPtr;
 
-// struct LtStruct<'a> {
-//     _data: &'a [u8],
-// }
+mod test {
 
-// #[vtable]
-// pub trait Test {
-//     fn returns_ref_implicit(&self) -> &u32;
-//     fn returns_lt_bound_struct(&self) -> LtStruct<'_>;
-//     fn returns_ref_complex<'a, 'b>(&'a self, other: &'b u32) -> &'a u32;
-// }
+    pub use bridgeless::foreign::*;
 
-// #[vtable]
-// pub trait Base {
-//     fn a(&self, arg1: u32) -> bool {
-//         false
-//     }
-//     unsafe fn b(&self, arg1: *const u8, arg2: u32) -> bool;
-// }
+    pub struct A;
+    pub trait AFwd: TraitOf<A> {}
+    impl MyDynTrait for A {
+        type T = dyn AFwd;
+    }
+    impl<T: MyDynTrait> InternalTraitOf<A> for Wrapper<T> where <T as MyDynTrait>::T: TraitOf<A> {}
 
-// #[vtable]
-// pub(crate) trait Derived: Base {
-//     fn c(&mut self) -> usize;
-// }
+    pub struct B;
+    pub trait BFwd: TraitOf<B> {}
+    impl MyDynTrait for B {
+        type T = dyn BFwd;
+    }
+    impl<T: MyDynTrait> InternalTraitOf<B> for Wrapper<T> where <T as MyDynTrait>::T: TraitOf<B> {}
 
-// #[derive(Default, Debug)]
-// struct DerivedImpl {
-//     // VPtr<dyn T, Self: T> supports `Default`, so your compile-time generated vtable
-//     // can be automatically provided to the object
-//     vftable: VmtPtr<dyn Derived, Self>,
-// }
+    pub struct C;
+    pub trait CFwd: TraitOf<A> + TraitOf<B> + TraitOf<C> {}
+    impl MyDynTrait for C {
+        type T = dyn CFwd;
+    }
+    impl<T: MyDynTrait> InternalTraitOf<C> for Wrapper<T> where <T as MyDynTrait>::T: TraitOf<C> {}
 
-// impl Base for DerivedImpl {
-//     extern "C" fn a(&self, arg1: u32) -> bool {
-//         arg1 == 42
-//     }
+    fn test(x: impl TraitOf<B>) {}
 
-//     unsafe extern "C" fn b(&self, _arg1: *const u8, _arg2: u32) -> bool {
-//         false
-//     }
-// }
-
-// impl Derived for DerivedImpl {
-//     extern "C" fn c(&mut self) -> usize {
-//         1234
-//     }
-// }
-
-// #[test]
-// fn default_derived_impls_correct() {
-//     let mut d = DerivedImpl::default();
-
-//     let vmt_copy = d.vftable;
-
-//     assert_eq!(d.a(42), (d.vftable.a)(&d, 42));
-
-//     unsafe {
-//         let s = b"abc";
-//         let ptr = s.as_ptr();
-//         assert_eq!(d.b(ptr, 420), (d.vftable.b)(&d, ptr, 420));
-//     }
-
-//     assert_eq!(d.c(), (d.vftable.c)(&mut d))
-// }
-
-#[repr(C)]
-pub struct BaseData {
-    pub a: u32,
+    fn test2() {
+        test(C)
+    }
 }
 
-pub trait Base: 'static {
-    extern "C" fn virtual_fn(&self) -> u32;
+//impl<T, Tail: Contains<T>> Contains<T> for TNode<T, Tail> {}
+
+#[allow(non_camel_case_types)]
+trait A_Impl: 'static {
+    fn virt_a(&mut self) -> usize {
+        unimplemented!()
+    }
+}
+
+trait A: A_Impl {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AVmt(for<'a> unsafe extern "C" fn(&'a mut u8) -> usize);
+
+#[repr(C)]
+struct AData {
+    a_field: usize,
 }
 
 #[repr(C)]
-pub struct BaseVtable<T: 'static> {
-    virtual_fn: extern "C" fn(this: &T) -> &u32,
+struct ALayout<V: 'static>(&'static V, AData);
+impl<V: 'static> AsRef<AData> for ALayout<V> {
+    fn as_ref(&self) -> &AData {
+        &self.1
+    }
+}
+impl<V: 'static> AsMut<AData> for ALayout<V> {
+    fn as_mut(&mut self) -> &mut AData {
+        &mut self.1
+    }
 }
 
-impl<T: 'static> Clone for BaseVtable<T> {
-    fn clone(&self) -> Self {
-        Self {
-            virtual_fn: self.virtual_fn,
+unsafe impl Class for dyn A {
+    type Data = AData;
+    type Vmt = AVmt;
+    type Layout<V: 'static> = ALayout<V>;
+    type VmtSource<T: 'static + FromThinPtr + ?Sized, const OFFSET: usize> =
+        AVmtSource<T, OFFSET, Impl<dyn A>>;
+
+    fn base_offset<C: Class + ?Sized>() -> Option<usize> {
+        unimplemented!()
+    }
+}
+
+unsafe impl<C: Class + A + ?Sized> internal::SubclassOf<dyn A> for internal::SubclassOfWrapper<C> {}
+
+pub struct AVmtSource<T: 'static + FromThinPtr + ?Sized, const OFFSET: usize, I: 'static + ?Sized>(
+    PhantomData<fn() -> (&'static I, &'static T)>,
+);
+
+struct AThunkGenerator<T: A_Impl + FromThinPtr + ?Sized, const OFFSET: usize>(
+    PhantomData<fn() -> &'static T>,
+);
+impl<T: A_Impl + FromThinPtr + ?Sized, const OFFSET: usize> AThunkGenerator<T, OFFSET> {
+    unsafe extern "C" fn virt_a(thisptr: &mut u8) -> usize {
+        let instance_ptr = (thisptr as *mut u8).sub(OFFSET);
+        (&mut *T::from_thin_ptr_mut(instance_ptr)).virt_a()
+    }
+}
+
+unsafe impl<T: FromThinPtr + ?Sized, const OFFSET: usize, I> BaseVtableFor<dyn A>
+    for AVmtSource<T, OFFSET, I>
+where
+    I: A_Impl + FromThinPtr + ?Sized,
+{
+    const VTABLE: <dyn A as Class>::Vmt = AVmt(AThunkGenerator::<I, OFFSET>::virt_a);
+    const VTABLE_REF: &'static <dyn A as Class>::Vmt = &AVmt(AThunkGenerator::<I, OFFSET>::virt_a);
+}
+
+impl<T: A_Impl + FromThinPtr + ?Sized, const OFFSET: usize> AVmtSource<T, OFFSET, Impl<dyn A>> {
+    pub const VTABLE: <dyn A as Class>::Vmt = AVmt(AThunkGenerator::<T, OFFSET>::virt_a);
+    pub const VTABLE_REF: &'static <dyn A as Class>::Vmt =
+        &AVmt(AThunkGenerator::<T, OFFSET>::virt_a);
+}
+
+impl<C: A + Class + ?Sized> A_Impl for DynCls<C> {
+    fn virt_a(&mut self) -> usize {
+        let base_offset = C::base_offset::<dyn A>().expect("Unreachable code ran");
+        unsafe {
+            let thin_ptr = (self as *mut _ as *mut u8).add(base_offset);
+            let func = (*(thin_ptr as *mut AVmt)).0;
+            (func)(&mut *thin_ptr)
         }
     }
 }
 
-impl<T: 'static> Copy for BaseVtable<T> {}
-
-unsafe impl Class for dyn Base {
-    type Vmt<T: 'static> = BaseVtable<T>;
-    type Data = BaseData;
+impl A_Impl for Impl<dyn A> {
+    fn virt_a(&mut self) -> usize {
+        0
+    }
 }
 
-unsafe impl<T: Base + Class + ?Sized> internal::SubclassOf<dyn Base>
-    for internal::SubclassOfWrapper<T>
-{
+struct Derived {}
+impl FromThinPtr for Derived {
+    unsafe fn from_thin_ptr(ptr: *const u8) -> *const Self {
+        todo!()
+    }
+    unsafe fn from_thin_ptr_mut(ptr: *mut u8) -> *mut Self {
+        todo!()
+    }
 }
 
-fn test(x: CRefMut<'_, dyn Base>, y: CRefMut<'_, dyn Base>) {}
-
-#[repr(C)]
-pub struct Derived {
-    _base: BaseData,
-    b: usize,
-}
-
-#[repr(C)]
-pub struct Derived2 {
-    _base: BaseData,
-    b: usize,
+const fn test() -> &'static AVmt {
+    <dyn A as Class>::VmtSource::<Derived, 0>::VTABLE_REF
 }
