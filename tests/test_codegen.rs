@@ -46,43 +46,45 @@ trait A_Impl: 'static {
     }
 }
 
-trait A: A_Impl {}
+#[repr(C)]
+struct A {
+    a_field: usize,
+}
+trait A_SubclassHelper: internal::SubclassOf<A> {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AVmt(for<'a> unsafe extern "C" fn(&'a mut u8) -> usize);
 
 #[repr(C)]
-struct AData {
-    a_field: usize,
-}
-
-#[repr(C)]
-struct ALayout<V: 'static>(&'static V, AData);
-impl<V: 'static> AsRef<AData> for ALayout<V> {
-    fn as_ref(&self) -> &AData {
+struct ALayout<V: 'static>(&'static V, A);
+impl<V: 'static> AsRef<A> for ALayout<V> {
+    fn as_ref(&self) -> &A {
         &self.1
     }
 }
-impl<V: 'static> AsMut<AData> for ALayout<V> {
-    fn as_mut(&mut self) -> &mut AData {
+impl<V: 'static> AsMut<A> for ALayout<V> {
+    fn as_mut(&mut self) -> &mut A {
         &mut self.1
     }
 }
 
-unsafe impl Class for dyn A {
-    type Data = AData;
+unsafe impl Class for A {
+    type _SubclassOfHelper = dyn A_SubclassHelper;
     type Vmt = AVmt;
     type Layout<V: 'static> = ALayout<V>;
     type VmtSource<T: 'static + FromThinPtr + ?Sized, const OFFSET: usize> =
-        AVmtSource<T, OFFSET, Impl<dyn A>>;
+        AVmtSource<T, OFFSET, Impl<A>>;
 
     fn base_offset<C: Class + ?Sized>() -> Option<usize> {
         unimplemented!()
     }
 }
 
-unsafe impl<C: Class + A + ?Sized> internal::SubclassOf<dyn A> for internal::SubclassOfWrapper<C> {}
+unsafe impl<C: Class> internal::SubclassOf<A> for internal::SubclassOfWrapper<C> where
+    <C as Class>::_SubclassOfHelper: internal::SubclassOf<C>
+{
+}
 
 pub struct AVmtSource<T: 'static + FromThinPtr + ?Sized, const OFFSET: usize, I: 'static + ?Sized>(
     PhantomData<fn() -> (&'static I, &'static T)>,
@@ -98,24 +100,33 @@ impl<T: A_Impl + FromThinPtr + ?Sized, const OFFSET: usize> AThunkGenerator<T, O
     }
 }
 
-unsafe impl<T: FromThinPtr + ?Sized, const OFFSET: usize, I> BaseVtableFor<dyn A>
+unsafe impl<T: FromThinPtr + ?Sized, const OFFSET: usize, I> BaseVtableFor<A>
     for AVmtSource<T, OFFSET, I>
 where
     I: A_Impl + FromThinPtr + ?Sized,
 {
-    const VTABLE: <dyn A as Class>::Vmt = AVmt(AThunkGenerator::<I, OFFSET>::virt_a);
-    const VTABLE_REF: &'static <dyn A as Class>::Vmt = &AVmt(AThunkGenerator::<I, OFFSET>::virt_a);
+    const VTABLE: <A as Class>::Vmt = AVmt(AThunkGenerator::<I, OFFSET>::virt_a);
+    const VTABLE_REF: &'static <A as Class>::Vmt = &AVmt(AThunkGenerator::<I, OFFSET>::virt_a);
 }
 
-impl<T: A_Impl + FromThinPtr + ?Sized, const OFFSET: usize> AVmtSource<T, OFFSET, Impl<dyn A>> {
-    pub const VTABLE: <dyn A as Class>::Vmt = AVmt(AThunkGenerator::<T, OFFSET>::virt_a);
-    pub const VTABLE_REF: &'static <dyn A as Class>::Vmt =
-        &AVmt(AThunkGenerator::<T, OFFSET>::virt_a);
+impl<T: A_Impl + FromThinPtr + ?Sized, const OFFSET: usize> AVmtSource<T, OFFSET, Impl<A>> {
+    pub const VTABLE: <A as Class>::Vmt = AVmt(AThunkGenerator::<T, OFFSET>::virt_a);
+    pub const VTABLE_REF: &'static <A as Class>::Vmt = &AVmt(AThunkGenerator::<T, OFFSET>::virt_a);
 }
 
-impl<C: A + Class + ?Sized> A_Impl for DynCls<C> {
+impl<C: SubclassOf<A>> A_Impl for DynCls<C> {
     fn virt_a(&mut self) -> usize {
-        let base_offset = C::base_offset::<dyn A>().expect("Unreachable code ran");
+        let base_offset = C::base_offset::<A>().expect("Unreachable code ran");
+        unsafe {
+            let thin_ptr = (self as *mut _ as *mut u8).add(base_offset);
+            let func = (*(thin_ptr as *mut AVmt)).0;
+            (func)(&mut *thin_ptr)
+        }
+    }
+}
+impl<C: SubclassOf<A>> A_Impl for Cls<C> {
+    fn virt_a(&mut self) -> usize {
+        let base_offset = C::base_offset::<A>().expect("Unreachable code ran");
         unsafe {
             let thin_ptr = (self as *mut _ as *mut u8).add(base_offset);
             let func = (*(thin_ptr as *mut AVmt)).0;
@@ -124,10 +135,14 @@ impl<C: A + Class + ?Sized> A_Impl for DynCls<C> {
     }
 }
 
-impl A_Impl for Impl<dyn A> {
-    fn virt_a(&mut self) -> usize {
-        0
-    }
+impl A_Impl for Impl<A> {
+    fn virt_a(&mut self) -> usize {}
+}
+
+impl A {
+    pub fn new(data: A) -> Cls<A> {}
+
+    pub fn non_virtual(self: &DynCls<A>) {}
 }
 
 struct Derived {}
@@ -141,5 +156,5 @@ impl FromThinPtr for Derived {
 }
 
 const fn test() -> &'static AVmt {
-    <dyn A as Class>::VmtSource::<Derived, 0>::VTABLE_REF
+    <A as Class>::VmtSource::<Derived, 0>::VTABLE_REF
 }
