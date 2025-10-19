@@ -6,11 +6,35 @@ use core::{
     ptr::NonNull,
 };
 
-//TODO: pub use bridgeless_proc_macros::class;
+pub use bridgeless_proc_macros::class;
 
 pub mod internal;
 
 use internal::FromThinPtr;
+
+/// Trait implemented on types that match a class's memory layout.
+pub trait ClassLayout<VPtr: 'static + Copy>: 'static {
+    /// The data of the class, excluding that from base class or vtables.
+    type Data: 'static;
+
+    /// Get a reference to the class's data.
+    fn data(&self) -> &Self::Data;
+
+    /// Get a mutable reference to the class's data.
+    fn data_mut(&mut self) -> &mut Self::Data;
+
+    /// Get a pointer to the class's vtable.
+    ///
+    /// This is typically a static reference to vtable data, or `()` when no vtable is present.
+    fn vtable(&self) -> VPtr;
+
+    /// Get a mutable reference to the vtable pointer.
+    ///
+    /// # SAFETY
+    /// While this function isn't a-priori unsafe, if this layout comes from a [`Cls`] or associated
+    /// type, modifying the vtable is very dangerous!
+    unsafe fn vtable_mut(&mut self) -> &mut VPtr;
+}
 
 /// Metadata trait specifying the layout of a C++ class without virtual bases.
 ///
@@ -18,25 +42,26 @@ use internal::FromThinPtr;
 /// **This trait should not be implemented manually**. Invariants that
 /// guarantee soundness are not stable and may change subtly between versions.
 pub unsafe trait Class: 'static + Sized {
-    /// Helper associated type for powering the `SubclassOf` magic.
-    type _SubclassOfHelper: ?Sized;
+    /// `dyn Trait` type used to implement [`SubclassOf`]. The same trait is
+    /// the identifier that must be used to declare a base in the class macro.
+    type _InheritTrait: ?Sized;
 
     /// The full class layout, FFI-compatible with the equivalent C++ object.
     ///
-    /// `V` is the main (first) vtable.
-    type Layout<V: 'static>: 'static + AsRef<Self> + AsMut<Self>;
+    /// `VPtr` is the main (first) vtable.
+    type Layout<VPtr: 'static + Copy>: ClassLayout<VPtr, Data = Self>;
+
+    /// Type of the BRUH
+    type VmtPart: 'static + Copy;
 
     /// Type of the main vtable (the one at offset 0) of the class.
     type Vmt: 'static + Copy;
 
-    /// GAT used internally to build virtual function tables at compile-time.
+    /// Type of the vtable pointer included in the layout struct.
     ///
-    /// By having the resulting type implement both a blanket `BaseVtableFor` impl
-    /// pointing to the base class's vtable and a blanket non-trait impl providing
-    /// the derived vtables, we have DIY specialization!
-    type VmtSource<T, const OFFSET: usize>
-    where
-        T: 'static + internal::FromThinPtr + ?Sized;
+    /// This should be &'static [`Class::Vmt`] for classes with a vtable, and () for classes without
+    /// one.
+    type VmtPtr: 'static + Copy;
 
     /// If `C` is a base class of `Self` (i.e. `Self: SubclassOf<C>`), returns the
     /// offset of `C`'s layout in `Self::Layout`. Otherwise, returns [`None`].
@@ -45,17 +70,6 @@ pub unsafe trait Class: 'static + Sized {
     /// currently possible without specialization. Instead, it is implemented such that it can
     /// be inlined to a constant when optimizations are applied.
     fn base_offset<C: Class>() -> Option<usize>;
-}
-
-/// Trait implemented by certain type configurations of [`Class::VmtSource`] to provide a
-/// fallback "specialization" of `C`'s function table that allows for C++ like method inhertiance.
-///
-/// # SAFETY
-/// **This trait should not be implemented manually**. Invariants that
-/// guarantee soundness are not stable and may change subtly between versions.
-pub unsafe trait BaseVtableFor<C: Class> {
-    const VTABLE: C::Vmt;
-    const VTABLE_REF: &'static C::Vmt;
 }
 
 /// Custom marker trait signifying that a given [`Class`] is an (inclusive) subclass of `B`.
@@ -83,17 +97,17 @@ pub fn base_offset<B: Class, C: SubclassOf<B>>() -> usize {
 /// [`AsMut`] for all base classes of `C`, so these methods may be used to access base data.
 /// Virtual methods of base classes can be called without needing to do this.
 #[repr(C)]
-pub struct Cls<C: Class>(C::Layout<&'static C::Vmt>);
+pub struct Cls<C: Class>(C::Layout<C::VmtPtr>);
 
 impl<C: Class> Cls<C> {
     /// Upcast to a base type. The equivalent of `static_cast<B& const>(self)` in C++.
     #[inline(always)]
     pub fn upcast<B: Class>(&self) -> &DynCls<B>
     where
-        Self: SubclassOf<B>,
+        C: SubclassOf<B>,
     {
         unsafe {
-            let base_thin_ptr = (self as *const _ as *const u8).add(base_offset::<B, Self>());
+            let base_thin_ptr = (self as *const _ as *const u8).add(base_offset::<B, C>());
             &*FromThinPtr::from_thin_ptr(base_thin_ptr)
         }
     }
@@ -102,10 +116,10 @@ impl<C: Class> Cls<C> {
     #[inline(always)]
     pub fn upcast_mut<B: Class>(&mut self) -> &mut DynCls<B>
     where
-        Self: SubclassOf<B>,
+        C: SubclassOf<B>,
     {
         unsafe {
-            let base_thin_ptr = (self as *mut _ as *mut u8).add(base_offset::<B, Self>());
+            let base_thin_ptr = (self as *mut _ as *mut u8).add(base_offset::<B, C>());
             &mut *FromThinPtr::from_thin_ptr_mut(base_thin_ptr)
         }
     }
@@ -121,6 +135,45 @@ impl<C: Class> Cls<C> {
     pub fn as_dyn_mut(&mut self) -> &mut DynCls<C> {
         unsafe { &mut *FromThinPtr::from_thin_ptr_mut(self as *mut _ as *mut u8) }
     }
+
+    /// Gets a reference to this class instance's inner layout.
+    #[inline(always)]
+    pub fn layout(&self) -> &C::Layout<C::VmtPtr> {
+        &self.0
+    }
+
+    /// Gets a mutable reference to this class instance's inner layout.
+    ///
+    /// # Safety
+    /// Mutable access to the class layout is unsafe. In particular, it lets you overwrite
+    /// the object's vtable, which is *very* dangerous!
+    #[inline(always)]
+    pub unsafe fn layout_mut(&mut self) -> &mut C::Layout<C::VmtPtr> {
+        &mut self.0
+    }
+
+    /// Consumes `self`, returning the class instance's inner layout.
+    /// # Safety
+    /// Mutable access to the class layout is unsafe. In particular, it lets you overwrite
+    /// the object's vtable, which is *very* dangerous!
+    #[inline(always)]
+    pub unsafe fn into_layout(self) -> C::Layout<C::VmtPtr> {
+        self.0
+    }
+
+    /// Creates an instance of the class given a fully populated layout.
+    ///
+    /// # Safety
+    /// The layout must be properly initialized, with each vtable pointing to the correct one
+    /// for the classes involved.
+    #[inline(always)]
+    pub unsafe fn from_layout(layout: C::Layout<C::VmtPtr>) -> Self {
+        Self(layout)
+    }
+}
+
+impl<C: Class> internal::ClassWrapper for Cls<C> {
+    type ClsType = C;
 }
 
 impl<C: Class> Deref for Cls<C> {
@@ -128,13 +181,13 @@ impl<C: Class> Deref for Cls<C> {
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
+        self.0.data()
     }
 }
 impl<C: Class> DerefMut for Cls<C> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut()
+        self.0.data_mut()
     }
 }
 
@@ -181,7 +234,7 @@ impl<B: Class, C: SubclassOf<B>> AsRef<Cls<B>> for Cls<C> {
 /// [`AsMut`] for all base classes of `C`, so these methods may be used to access base data.
 /// Virtual methods of base classes can be called without needing to do this.
 #[repr(C)]
-pub struct DynCls<C: Class>(C::Layout<&'static C::Vmt>, [()]);
+pub struct DynCls<C: Class>(C::Layout<C::VmtPtr>, [()]);
 
 impl<C: Class> FromThinPtr for DynCls<C> {
     #[inline(always)]
@@ -200,10 +253,10 @@ impl<C: Class> DynCls<C> {
     #[inline(always)]
     pub fn upcast<B: Class>(&self) -> &DynCls<B>
     where
-        Self: SubclassOf<B>,
+        C: SubclassOf<B>,
     {
         unsafe {
-            let base_thin_ptr = (self as *const _ as *const u8).add(base_offset::<B, Self>());
+            let base_thin_ptr = (self as *const _ as *const u8).add(base_offset::<B, C>());
             &*FromThinPtr::from_thin_ptr(base_thin_ptr)
         }
     }
@@ -212,10 +265,10 @@ impl<C: Class> DynCls<C> {
     #[inline(always)]
     pub fn upcast_mut<B: Class>(&mut self) -> &mut DynCls<B>
     where
-        Self: SubclassOf<B>,
+        C: SubclassOf<B>,
     {
         unsafe {
-            let base_thin_ptr = (self as *mut _ as *mut u8).add(base_offset::<B, Self>());
+            let base_thin_ptr = (self as *mut _ as *mut u8).add(base_offset::<B, C>());
             &mut *FromThinPtr::from_thin_ptr_mut(base_thin_ptr)
         }
     }
@@ -260,18 +313,22 @@ impl<C: Class> DynCls<C> {
     }
 }
 
+impl<C: Class> internal::ClassWrapper for DynCls<C> {
+    type ClsType = C;
+}
+
 impl<C: Class> Deref for DynCls<C> {
     type Target = C;
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
+        self.0.data()
     }
 }
 impl<C: Class> DerefMut for DynCls<C> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut()
+        self.0.data_mut()
     }
 }
 
@@ -518,11 +575,7 @@ impl<B: Class, C: SubclassOf<B>> AsMut<DynCls<B>> for CBox<C> {
 }
 
 /// Marker type used to provide virtual function implementations for a given type. Has the same
-/// layout as [`DynCls<C>`].
-///
-/// [`Impl`] can [`DerefMut`] into the [`Class`] type. However, unlike [`DynCls`] and [`Cls`],
-/// it does not implement any virtual function trait. One must explicitly upcast to a [`Impl<Base>`]
-/// to execute its logic!
+/// layout as [`DynCls<C>`], which it can [`DerefMut`] into.
 #[repr(C)]
 pub struct Impl<C: Class>(DynCls<C>);
 
@@ -538,44 +591,24 @@ impl<C: Class> FromThinPtr for Impl<C> {
     }
 }
 
+impl<C: Class> internal::ClassWrapper for Impl<C> {
+    type ClsType = C;
+}
+
 impl<C: Class> Deref for Impl<C> {
-    type Target = C;
+    type Target = DynCls<C>;
 
     fn deref(&self) -> &Self::Target {
-        self.0.deref()
+        &self.0
     }
 }
 impl<C: Class> DerefMut for Impl<C> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.deref_mut()
+        &mut self.0
     }
 }
 
 impl<C: Class> Impl<C> {
-    /// Upcast to a base type. The equivalent of `static_cast<B& const>(self)` in C++.
-    #[inline(always)]
-    pub fn upcast<B: Class>(&self) -> &Impl<B>
-    where
-        Self: SubclassOf<B>,
-    {
-        unsafe {
-            let base_thin_ptr = (self as *const _ as *const u8).add(base_offset::<B, Self>());
-            &*FromThinPtr::from_thin_ptr(base_thin_ptr)
-        }
-    }
-
-    /// Upcast to a base type. The equivalent of `static_cast<B&>(self)` in C++.
-    #[inline(always)]
-    pub fn upcast_mut<B: Class>(&mut self) -> &mut Impl<B>
-    where
-        Self: SubclassOf<B>,
-    {
-        unsafe {
-            let base_thin_ptr = (self as *mut _ as *mut u8).add(base_offset::<B, Self>());
-            &mut *FromThinPtr::from_thin_ptr_mut(base_thin_ptr)
-        }
-    }
-
     /// Convert this instance into its equivalent dynamic type.
     #[inline(always)]
     pub fn as_dyn(&self) -> &DynCls<C> {
@@ -589,18 +622,50 @@ impl<C: Class> Impl<C> {
     }
 }
 
-pub mod foreign {
-    pub trait MyDynTrait {
-        type T: ?Sized;
+impl<B: Class, C: SubclassOf<B>> AsRef<DynCls<B>> for Impl<C> {
+    #[inline(always)]
+    fn as_ref(&self) -> &DynCls<B> {
+        self.0.as_ref()
+    }
+}
+impl<B: Class, C: SubclassOf<B>> AsMut<DynCls<B>> for Impl<C> {
+    #[inline(always)]
+    fn as_mut(&mut self) -> &mut DynCls<B> {
+        self.0.as_mut()
+    }
+}
+
+pub mod bruh {
+    pub trait DirectSubclassOf<B> {
+        //const OFFSET: usize;
     }
 
-    pub trait TraitOf<S> {}
+    pub trait SubclassOf<Base, Path> {
+        //const OFFSET: usize;
+    }
 
-    pub trait InternalTraitOf<S> {}
-
+    pub trait InternalSubclassOf<DirectBase, TransitiveBase, Path> {
+        //const OFFSET: usize;
+    }
     pub struct Wrapper<T>(T);
 
-    impl<T, U> TraitOf<T> for U where Wrapper<U>: InternalTraitOf<T> {}
+    pub struct DerivedFrom<Cls, Path>(Cls, Path);
 
-    //impl<X, T, U> TraitOf<X> for T where (T, U): InternalTraitOf<X, U> {}
+    impl<T> SubclassOf<T, ()> for T {
+        //const OFFSET: usize = 0;
+    }
+
+    impl<Cls, Base, TransitiveBase, Path> SubclassOf<TransitiveBase, (Base, Path)> for Cls where
+        Wrapper<Cls>: InternalSubclassOf<Base, TransitiveBase, Path>
+    {
+    }
+
+    // impl<Cls, Base, TransitiveBase, BasePath>
+    //     SubclassOf<TransitiveBase, DerivedFrom<Base, BasePath>> for Cls
+    // where
+    //     Cls: DirectSubclassOf<Base>,
+    //     Base: SubclassOf<TransitiveBase, BasePath>,
+    // {
+    //     //const OFFSET: usize = Cls::OFFSET + Base::OFFSET;
+    // }
 }

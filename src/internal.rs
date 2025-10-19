@@ -1,4 +1,13 @@
+use core::{marker::PhantomData, ops::Add};
+
 use crate::Class;
+
+/// Trait implemented by types that are wrappers around a class layout,
+/// such as `Cls`, `DynCls`, and `Impl`.
+pub trait ClassWrapper {
+    /// The class this wrapper is representing the layout of.
+    type ClsType: Class;
+}
 
 /// Converts a thin type erased pointer to a (potentially fat) typed pointer.
 pub trait FromThinPtr {
@@ -19,6 +28,42 @@ pub struct SubclassOfWrapper<T: ?Sized>(T);
 unsafe impl<B: Class + ?Sized, D: Class + ?Sized> crate::SubclassOf<B> for D where
     SubclassOfWrapper<D>: SubclassOf<B>
 {
+}
+
+pub struct FallbackVmtGen<O, F>(PhantomData<(O, F)>);
+
+/// Trait around a type with a usize associated const.
+///
+/// This is required to be able to do math on const generics without the generic_const_exprs
+/// experimental feature.
+pub trait HasConst<T> {
+    const VALUE: T;
+}
+
+pub struct ConstUsizeValue<const N: usize>;
+impl<const N: usize> HasConst<usize> for ConstUsizeValue<N> {
+    const VALUE: usize = N;
+}
+
+/// Type implementing [`ConstUsize`] which adds a constant to an existing [`ConstUsize`].
+pub struct AddConst<T: HasConst<usize>, const N: usize>(PhantomData<T>);
+impl<T: HasConst<usize>, const N: usize> HasConst<usize> for AddConst<T, N> {
+    const VALUE: usize = N + T::VALUE;
+}
+
+pub struct AddConsts<U: HasConst<usize>, V: HasConst<usize>>(PhantomData<(U, V)>);
+impl<U: HasConst<usize>, V: HasConst<usize>> HasConst<usize> for AddConsts<U, V> {
+    const VALUE: usize = U::VALUE + V::VALUE;
+}
+
+/// Trait implemented by certain type configurations of [`Class::VmtSource`] to provide a
+/// fallback "specialization" of `C`'s function table that allows for C++ like method inhertiance.
+///
+/// # SAFETY
+/// **This trait should not be implemented manually**. Invariants that
+/// guarantee soundness are not stable and may change subtly between versions.
+pub unsafe trait VmtPartGen<C: Class> {
+    type ForOffset<Ofs: HasConst<usize>>: HasConst<C::VmtPart>;
 }
 
 /// Given a list of the size of the virtual function tables of all base classes,
